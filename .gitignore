@@ -2,3 +2,4 @@
 .env.*
 .myvenv
 .myvenv.*
+./frontend/next
