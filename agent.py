@@ -1,6 +1,8 @@
 import os
 import requests
 import uuid
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from langchain_huggingface import HuggingFaceEndpoint,HuggingFaceEmbeddings,ChatHuggingFace
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain.messages import HumanMessage,AIMessage
@@ -17,9 +19,24 @@ from langchain_core.output_parsers import StrOutputParser
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from pydantic import BaseModel
 import os
+
+
 load_dotenv()
 
+################################CONFIGURATIONS############################################
+api = FastAPI()
+
+api.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+##########################FIRST LLM THAT GENERATS AN ANSWER#################################
 endpoint=HuggingFaceEndpoint(
     model="deepseek-ai/DeepSeek-V4-Flash-0731",
     task="text-generation",
@@ -30,6 +47,8 @@ endpoint=HuggingFaceEndpoint(
 model=ChatHuggingFace(
     llm=endpoint
 )
+
+########################SECOND LLM FOR THE CONFIDENCE EVALUATION#############################
 
 endpointEvaluator=HuggingFaceEndpoint(
     model="deepseek-ai/DeepSeek-V4-Flash-0731",
@@ -73,7 +92,9 @@ class AIBOTState(TypedDict):
     confidence:int
     context: str
   
-    
+
+class ChatRequest(BaseModel):
+    message: str    
 
 def RAGNode(state:AIBOTState):
     #Similarity Search-----
@@ -240,5 +261,21 @@ graph.add_edge('human',END)
 
 app=graph.compile()
 
-result=app.invoke({"message":"What is the refund policy?"})
-print(result['ragResponse'])
+@api.get("/health")
+def health():
+    return {
+        "status": "ok"
+    }
+
+
+@api.post("/chat")
+def chat(request: ChatRequest):
+
+    result = app.invoke({
+        "message": request.message
+    })
+
+    return {
+        "response": result["ragResponse"],
+        "confidence": result["confidence"]
+    }
