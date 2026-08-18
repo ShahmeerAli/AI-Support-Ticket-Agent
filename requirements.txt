@@ -1,0 +1,19 @@
+# LangChain Core
+langchain
+langchain-core
+langchain-community
+
+
+# Hugging Face Integration---can use openAI/Anthropic/Gemini
+langchain-huggingface
+transformers
+huggingface-hub
+
+# Environment Variable Management
+python-dotenv
+
+langgraph
+ 
+langgraph-checkpoint-sqlite
+sentence-transformers
+fastapi
