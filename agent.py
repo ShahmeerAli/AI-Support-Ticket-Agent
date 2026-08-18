@@ -9,11 +9,15 @@ from typing import Annotated, Optional, TypedDict
 from langchain_community.vectorstores import Chroma
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.tools import tool
+from typing import Literal
 from langchain_community.document_loaders import PyPDFLoader
-from langgraph.graph import START, StateGraph
+from langgraph.graph import START, StateGraph,END
 from langgraph.prebuilt import ToolNode, tools_condition
 from langchain_core.output_parsers import StrOutputParser
-
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import os
 load_dotenv()
 
 endpoint=HuggingFaceEndpoint(
@@ -27,25 +31,23 @@ model=ChatHuggingFace(
     llm=endpoint
 )
 
+endpointEvaluator=HuggingFaceEndpoint(
+    model="deepseek-ai/DeepSeek-V4-Flash-0731",
+    task="text-generation",
+    max_new_tokens=1024,
+    temperature=0.4,  
+)
 
-#class to verify the confidence if its less than 8 contact helpline and the main node
-class AIBOTState(TypedDict):
-    message:str
-    ragResponse:str
-    confidence:int
-    humanResponse:bool
-    
+modelEvaluator=ChatHuggingFace(
+    llm=endpointEvaluator
+)
 
-def RAGNode(state:AIBOTState):
-    #Loading the document
-    loader=PyPDFLoader(
-        file_path="DOC.pdf"
-    )
-    docs=loader.load()
-    #Splitting the Document content
-    splitter=RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=100,
+
+ #Loading the document
+loader=PyPDFLoader(file_path="DOC.pdf")
+docs=loader.load()
+#Splitting the Document content
+splitter=RecursiveCharacterTextSplitter(chunk_size=1000,chunk_overlap=100,
         separators=[
             "\n\n",
             "\n",
@@ -53,24 +55,33 @@ def RAGNode(state:AIBOTState):
             ""
         ]
     )
-    splitter_docs=splitter.split_documents(docs)
-    #Embeddings creation
-    embeddings=HuggingFaceEmbeddings(
+splitter_docs=splitter.split_documents(docs)
+#Embeddings creation
+embeddings=HuggingFaceEmbeddings(
         model_name="sentence-transformers/all-MiniLM-L6-v2"
     )
-    #Now for the Embeddings to be stored in the VectorStore Chroma
-    vectorSore=Chroma.from_documents(
+#Now for the Embeddings to be stored in the VectorStore Chroma
+vectorSore=Chroma.from_documents(
         splitter_docs,embeddings
     )
+
+
+#class to verify the confidence if its less than 8 contact helpline and the main node
+class AIBOTState(TypedDict):
+    message:str
+    ragResponse:str
+    confidence:int
+    context: str
+  
+    
+
+def RAGNode(state:AIBOTState):
     #Similarity Search-----
-    retriever_docs=vectorSore.similarity_search_with_relevance_scores(
-        search_type='similarity',search_kwargs={'k':3}
+    retriever_docs=vectorSore.similarity_search(
+        state['message'],k=3
     )
 
-    documents = [
-        doc for doc, score in retriever_docs
-    ]
-
+    documents = retriever_docs
     # -----------------------------
     # Create context
     context = "\n\n".join(
@@ -94,7 +105,7 @@ def RAGNode(state:AIBOTState):
         "context":context,
         "question":state['message']
     })
-    return {'ragResponse':output}
+    return {'ragResponse':output,'context':context}
 
 
 
@@ -104,6 +115,8 @@ def ConfidenceScore(state:AIBOTState):
         Evaluate the following answer.
         Question:
         {question}
+         Context:
+        {context}
         Answer:
         {answer}
         Determine how well the answer is supported by the available
@@ -117,10 +130,115 @@ def ConfidenceScore(state:AIBOTState):
         Return ONLY the number.
         """
     )
-    chain=prompt|model|StrOutputParser()
+    chain=prompt|modelEvaluator|StrOutputParser()
     output=chain.invoke({
         'question':state["message"],
+        'context':state['context'],
         'answer':state['ragResponse']
     })
-    return {'confidence':output}
+    return {'confidence':int(output.strip())}
 
+
+#now the conditional Node
+def CheckCondition(state:AIBOTState):
+    if state["confidence"]>=8:
+        return "answer"
+    else:
+        return 'human'
+
+
+#answer node
+def answerNode(state:AIBOTState):
+    return {'ragResponse':state["ragResponse"]}
+
+
+#human escalation Node
+def human_node(state:AIBOTState):
+    email_data=human_email.invoke({"question":state['message'],"ai_message":state['ragResponse'],"confidence":state['confidence']})
+    return {
+        'ragResponse':(
+            "I am not sure about this scenario."
+            "This Scenario has been forwarded to a human."
+            "Contact Helpline for further details."
+        )
+    }
+
+
+
+@tool
+def human_email(
+    question:str,
+    ai_message:str,
+    confidence:int
+):
+    """AI SENDS AN EMAIL TO THE HUMAN IF THE CONFIDENCE SCORE IS
+        LOW.
+    """
+    result=send_email(
+        question,
+        ai_message,
+        confidence
+    )
+    return result
+
+def send_email(question:str,ai_message:str,confidence:int):
+    sender_email=os.getenv("EMAIL_ADDRESS")
+    sender_password = os.getenv("EMAIL_PASSWORD")
+    receiver_email=os.getenv("HUMAN_REVIEW_EMAIL")
+    message=MIMEMultipart()
+    message['FROM']=sender_email
+    message['To']=receiver_email
+    message['Subject']="Human Review Required"
+
+    body=f"""
+    AI confidence is low , requires Human Intervention
+    User_Question:
+    {question}
+    AI_Response:
+    {ai_message}
+    Confidence Score:
+    {confidence}/10
+
+    """
+
+    message.attach(MIMEText(body,'plain'))
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+
+        server.login(
+            sender_email,
+            sender_password
+        )
+
+        server.sendmail(
+            sender_email,
+            receiver_email,
+            message.as_string()
+        )
+    return "Your Case has been sent!"
+
+
+
+graph=StateGraph(AIBOTState)
+graph.add_node('rag',RAGNode)
+graph.add_node('confidence',ConfidenceScore)
+graph.add_node('answer',answerNode)
+graph.add_node('human',human_node)
+
+graph.add_edge(START,'rag')
+graph.add_edge('rag','confidence')
+graph.add_conditional_edges(
+    'confidence',
+    CheckCondition,
+    {
+        'answer':'answer',
+        'human':'human'
+    }
+)
+
+graph.add_edge('answer',END)
+graph.add_edge('human',END)
+
+app=graph.compile()
+
+result=app.invoke({"message":"What is the refund policy?"})
+print(result['ragResponse'])
